@@ -1,663 +1,764 @@
-import os
-import json
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
-import torch
-from PIL import Image
-from datasets import load_dataset
-from transformers import AutoProcessor, AutoModelForImageTextToText, AutoTokenizer
-import tinker
-from tinker import types
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import numpy as np
-
-
-@dataclass
-class Config:
-    model_name: str = "Qwen/Qwen3-8B"
-    blip_model_name: str = "Salesforce/blip-image-captioning-base"
-    
-    dataset_name: str = "derek-thomas/ScienceQA"
-    num_train_samples: Optional[int] = 2000
-    num_val_samples: Optional[int] = 500
-    num_test_samples: Optional[int] = 500
-    
-    batch_size: int = 128
-    learning_rate: float = 3e-5
-    num_epochs: int = 5
-    lora_r: int = 32
-    lora_alpha: int = 64
-    weight_decay: float = 0.01
-    dropout: float = 0.1
-    
-    eval_every_n_steps: int = 25
-    max_generation_tokens: int = 150
-    
-    use_chain_of_thought: bool = True
-    
-    preprocessed_data_dir: str = "./preprocessed_scienceqa"
-    output_dir: str = "./final_results"
-    plots_dir: str = "./plots"
-    
-    seed: int = 42
-
-
-config = Config()
-torch.manual_seed(config.seed)
-
-
-class BLIPPreprocessor:
-    def __init__(self, config: Config):
-        self.config = config
-        print(f"Loading BLIP model: {config.blip_model_name}")
-        
-        self.processor = AutoProcessor.from_pretrained(config.blip_model_name)
-        self.model = AutoModelForImageTextToText.from_pretrained(
-            config.blip_model_name,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
-        )
-        
-        if torch.cuda.is_available():
-            self.model = self.model.to("cuda")
-        self.model.eval()
-    
-    def caption_image(self, image: Image.Image) -> str:
-        if image is None:
-            return "[No image provided]"
-        try:
-            inputs = self.processor(images=image, return_tensors="pt")
-            if torch.cuda.is_available():
-                inputs = {k: v.to("cuda") for k, v in inputs.items()}
-            with torch.no_grad():
-                out = self.model.generate(**inputs, max_length=50)
-            return self.processor.decode(out[0], skip_special_tokens=True)
-        except:
-            return "[Image processing failed]"
-    
-    def create_prompt(self, example: dict, caption: str, use_cot: bool = False) -> str:
-        lecture = example.get('lecture', '') or example.get('hint', '') or "No additional context."
-        question = example['question']
-        choices = example['choices']
-        
-        choice_labels = ['A', 'B', 'C', 'D', 'E', 'F']
-        formatted_choices = '\n'.join([f"{choice_labels[i]}. {choice}" for i, choice in enumerate(choices)])
-        
-        if use_cot:
-            prompt = f"""Context: {lecture}
-
-Image Description: {caption}
-
-Question: {question}
-
-Choices:
-{formatted_choices}
-
-Let's think step by step:
-1. What is the question asking?
-2. What information is relevant?
-3. Which choice is correct?
-
-Answer:"""
-        else:
-            prompt = f"""Context: {lecture}
-
-Image Description: {caption}
-
-Question: {question}
-
-Choices:
-{formatted_choices}
-
-Answer:"""
-        
-        return prompt
-    
-    def get_answer_text(self, example: dict) -> str:
-        answer_idx = example['answer']
-        choices = example['choices']
-        choice_labels = ['A', 'B', 'C', 'D', 'E', 'F']
-        return f" {choice_labels[answer_idx]}. {choices[answer_idx]}"
-    
-    def caption_images_batch(self, images: List[Image.Image], batch_size: int = 32) -> List[str]:
-        """Caption multiple images in batches for speed"""
-        captions = []
-        valid_images = []
-        valid_indices = []
-        
-        for idx, img in enumerate(images):
-            if img is not None:
-                valid_images.append(img)
-                valid_indices.append(idx)
-        
-        for i in tqdm(range(0, len(valid_images), batch_size), desc="Captioning batches"):
-            batch = valid_images[i:i + batch_size]
-            try:
-                inputs = self.processor(images=batch, return_tensors="pt", padding=True)
-                if torch.cuda.is_available():
-                    inputs = {k: v.to("cuda") for k, v in inputs.items()}
-                with torch.no_grad():
-                    outputs = self.model.generate(**inputs, max_length=50)
-                batch_captions = [self.processor.decode(out, skip_special_tokens=True) for out in outputs]
-                captions.extend(batch_captions)
-            except Exception as e:
-                captions.extend(["[Image processing failed]"] * len(batch))
-        
-        result_captions = ["[No image provided]"] * len(images)
-        for idx, caption in zip(valid_indices, captions):
-            result_captions[idx] = caption
-        
-        return result_captions
-    
-    def preprocess_split(self, split: str, max_samples: Optional[int] = None) -> List[dict]:
-        print(f"\nPreprocessing {split} split...")
-        dataset = load_dataset(self.config.dataset_name, split=split)
-        
-        if max_samples:
-            dataset = dataset.select(range(min(max_samples, len(dataset))))
-        
-        print(f"Processing {len(dataset)} examples...")
-        
-        print("Extracting images...")
-        images = [example.get('image') for example in dataset]
-        
-        print("Captioning images in batches (this is MUCH faster)...")
-        captions = self.caption_images_batch(images, batch_size=32)
-        
-        print("Creating prompts...")
-        preprocessed = []
-        for idx, (example, caption) in enumerate(tqdm(zip(dataset, captions), total=len(dataset), desc="Creating prompts")):
-            prompt = self.create_prompt(example, caption, use_cot=self.config.use_chain_of_thought)
-            answer = self.get_answer_text(example)
-            
-            preprocessed.append({
-                'prompt': prompt,
-                'answer': answer,
-                'original_idx': idx,
-                'subject': example.get('subject', 'unknown'),
-                'grade': example.get('grade', 'unknown'),
-                'has_image': example.get('image') is not None,
-                'has_text': bool(example.get('lecture', '') or example.get('hint', ''))
-            })
-        
-        return preprocessed
-
-
-def create_datum(example: dict, tokenizer) -> types.Datum:
-    full_text = example['prompt'] + example['answer']
-    full_tokens = tokenizer.encode(full_text)
-    
-    prompt_tokens = tokenizer.encode(example['prompt'])
-    prompt_length = len(prompt_tokens)
-    
-    input_tokens = full_tokens[:-1]
-    target_tokens = full_tokens[1:]
-    weights = [0.0] * (prompt_length - 1) + [1.0] * (len(target_tokens) - (prompt_length - 1))
-    
-    return types.Datum(
-        model_input=types.ModelInput.from_ints(tokens=input_tokens),
-        loss_fn_inputs=dict(
-            target_tokens=target_tokens,
-            weights=weights
-        )
-    )
-
-
-def evaluate_accuracy(sampling_client, tokenizer, data: List[dict], split_name: str) -> Tuple[float, int, int]:
-    correct = 0
-    total = 0
-    
-    for example in tqdm(data, desc=f"Evaluating {split_name}"):
-        try:
-            tokens = tokenizer.encode(example['prompt'], add_special_tokens=False)
-            result = sampling_client.sample(
-                prompt=types.ModelInput.from_ints(tokens=tokens),
-                num_samples=1,
-                sampling_params=types.SamplingParams(max_tokens=config.max_generation_tokens, temperature=0.0)
-            ).result()
-            
-            prediction = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True).strip()
-            ground_truth = example['answer'].strip()
-            
-            if ground_truth and prediction:
-                gt_letter = ground_truth[0].upper()
-                pred_letter = None
-                for char in prediction:
-                    if char.isalpha():
-                        pred_letter = char.upper()
-                        break
-                if gt_letter == pred_letter:
-                    correct += 1
-            total += 1
-        except:
-            continue
-    
-    accuracy = (correct / total * 100) if total > 0 else 0
-    return accuracy, correct, total
-
-
-def evaluate_model_detailed(sampling_client, tokenizer, data: List[dict], model_name: str):
-    print(f"\nRunning inference on {len(data)} samples...")
-    
-    correct = 0
-    total = 0
-    results = []
-    
-    all_predictions = []
-    all_labels = []
-    all_subjects = []
-    all_grades = []
-    all_has_image = []
-    all_has_text = []
-    
-    for example in tqdm(data):
-        try:
-            tokens = tokenizer.encode(example['prompt'], add_special_tokens=False)
-            result = sampling_client.sample(
-                prompt=types.ModelInput.from_ints(tokens=tokens),
-                num_samples=1,
-                sampling_params=types.SamplingParams(max_tokens=config.max_generation_tokens, temperature=0.0)
-            ).result()
-            
-            prediction = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True).strip()
-            ground_truth = example['answer'].strip()
-            
-            is_correct = False
-            if ground_truth and prediction:
-                gt_letter = ground_truth[0].upper()
-                gt_idx = ord(gt_letter) - ord('A')
-                
-                pred_letter = None
-                for char in prediction:
-                    if char.isalpha():
-                        pred_letter = char.upper()
-                        break
-                pred_idx = ord(pred_letter) - ord('A') if pred_letter else -1
-                
-                is_correct = (gt_letter == pred_letter) if pred_letter else False
-                
-                all_predictions.append(pred_idx)
-                all_labels.append(gt_idx)
-                all_subjects.append(example.get('subject', 'unknown'))
-                all_grades.append(example.get('grade', 'unknown'))
-                all_has_image.append(example.get('has_image', False))
-                all_has_text.append(example.get('has_text', False))
-            
-            if is_correct:
-                correct += 1
-            total += 1
-            
-            results.append({
-                'correct': is_correct,
-                'prediction': prediction,
-                'ground_truth': ground_truth
-            })
-        except:
-            continue
-    
-    accuracy = (correct / total * 100) if total > 0 else 0
-    
-    predictions = np.array(all_predictions)
-    labels = np.array(all_labels)
-    subjects = np.array(all_subjects)
-    grades = np.array(all_grades)
-    has_image_arr = np.array(all_has_image)
-    has_text_arr = np.array(all_has_text)
-    
-    detailed_results = {}
-    detailed_results['Overall'] = (predictions == labels).mean() * 100 if len(predictions) > 0 else 0
-    
-    for subject in ['natural science', 'social science', 'language science']:
-        mask = subjects == subject
-        if mask.sum() > 0:
-            acc = (predictions[mask] == labels[mask]).mean() * 100
-            detailed_results[subject] = acc
-        else:
-            detailed_results[subject] = 0.0
-    
-    context_types = [
-        ('TXT', has_text_arr & ~has_image_arr),
-        ('IMG', has_image_arr & ~has_text_arr),
-        ('NO', ~has_image_arr & ~has_text_arr),
-        ('TXT+IMG', has_image_arr & has_text_arr)
-    ]
-    
-    for key, mask in context_types:
-        if mask.sum() > 0:
-            acc = (predictions[mask] == labels[mask]).mean() * 100
-            detailed_results[key] = acc
-        else:
-            detailed_results[key] = 0.0
-    
-    grade_nums = []
-    for g in grades:
-        try:
-            grade_nums.append(int(g.replace('grade', '')))
-        except:
-            grade_nums.append(0)
-    grade_nums = np.array(grade_nums)
-    
-    for key, condition in [('G1-6', (grade_nums >= 1) & (grade_nums <= 6)),
-                           ('G7-12', (grade_nums >= 7) & (grade_nums <= 12))]:
-        if condition.sum() > 0:
-            detailed_results[key] = (predictions[condition] == labels[condition]).mean() * 100
-        else:
-            detailed_results[key] = 0.0
-    
-    print(f"\nOverall: {detailed_results['Overall']:.2f}%")
-    print(f"Subject: NAT={detailed_results.get('natural science', 0):.2f}% | SOC={detailed_results.get('social science', 0):.2f}% | LAN={detailed_results.get('language science', 0):.2f}%")
-    print(f"Context: TXT={detailed_results.get('TXT', 0):.2f}% | IMG={detailed_results.get('IMG', 0):.2f}% | NO={detailed_results.get('NO', 0):.2f}% | TXT+IMG={detailed_results.get('TXT+IMG', 0):.2f}%")
-    print(f"Grade:   G1-6={detailed_results.get('G1-6', 0):.2f}% | G7-12={detailed_results.get('G7-12', 0):.2f}%")
-    
-    return {
-        'model': model_name,
-        'accuracy': accuracy,
-        'correct': correct,
-        'total': total,
-        'results': results,
-        'detailed_metrics': detailed_results
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    },
+    "accelerator": "GPU"
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "a1b2c3d4e5f6"
+      },
+      "outputs": [],
+      "source": [
+        "import os\n",
+        "import json\n",
+        "from dataclasses import dataclass\n",
+        "from typing import List, Optional, Tuple\n",
+        "import torch\n",
+        "from PIL import Image\n",
+        "from datasets import load_dataset\n",
+        "from transformers import AutoProcessor, AutoModelForImageTextToText, AutoTokenizer\n",
+        "import tinker\n",
+        "from tinker import types\n",
+        "from tqdm import tqdm\n",
+        "import matplotlib.pyplot as plt\n",
+        "import numpy as np\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "b2c3d4e5f6a1"
+      },
+      "outputs": [],
+      "source": [
+        "@dataclass\n",
+        "class Config:\n",
+        "    model_name: str = \"Qwen/Qwen3-8B\"\n",
+        "    blip_model_name: str = \"Salesforce/blip-image-captioning-base\"\n",
+        "    \n",
+        "    dataset_name: str = \"derek-thomas/ScienceQA\"\n",
+        "    num_train_samples: Optional[int] = 2000\n",
+        "    num_val_samples: Optional[int] = 500\n",
+        "    num_test_samples: Optional[int] = 500\n",
+        "    \n",
+        "    batch_size: int = 128\n",
+        "    learning_rate: float = 3e-5\n",
+        "    num_epochs: int = 5\n",
+        "    lora_r: int = 32\n",
+        "    lora_alpha: int = 64\n",
+        "    weight_decay: float = 0.01\n",
+        "    dropout: float = 0.1\n",
+        "    \n",
+        "    eval_every_n_steps: int = 25\n",
+        "    max_generation_tokens: int = 150\n",
+        "    \n",
+        "    use_chain_of_thought: bool = True\n",
+        "    \n",
+        "    preprocessed_data_dir: str = \"./preprocessed_scienceqa\"\n",
+        "    output_dir: str = \"./final_results\"\n",
+        "    plots_dir: str = \"./plots\"\n",
+        "    \n",
+        "    seed: int = 42\n",
+        "\n",
+        "\n",
+        "config = Config()\n",
+        "torch.manual_seed(config.seed)\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "c3d4e5f6a1b2"
+      },
+      "outputs": [],
+      "source": [
+        "class BLIPPreprocessor:\n",
+        "    def __init__(self, config: Config):\n",
+        "        self.config = config\n",
+        "        print(f\"Loading BLIP model: {config.blip_model_name}\")\n",
+        "        \n",
+        "        self.processor = AutoProcessor.from_pretrained(config.blip_model_name)\n",
+        "        self.model = AutoModelForImageTextToText.from_pretrained(\n",
+        "            config.blip_model_name,\n",
+        "            dtype=torch.float16 if torch.cuda.is_available() else torch.float32\n",
+        "        )\n",
+        "        \n",
+        "        if torch.cuda.is_available():\n",
+        "            self.model = self.model.to(\"cuda\")\n",
+        "        self.model.eval()\n",
+        "    \n",
+        "    def caption_image(self, image: Image.Image) -> str:\n",
+        "        if image is None:\n",
+        "            return \"[No image provided]\"\n",
+        "        try:\n",
+        "            inputs = self.processor(images=image, return_tensors=\"pt\")\n",
+        "            if torch.cuda.is_available():\n",
+        "                inputs = {k: v.to(\"cuda\") for k, v in inputs.items()}\n",
+        "            with torch.no_grad():\n",
+        "                out = self.model.generate(**inputs, max_length=50)\n",
+        "            return self.processor.decode(out[0], skip_special_tokens=True)\n",
+        "        except:\n",
+        "            return \"[Image processing failed]\"\n",
+        "    \n",
+        "    def create_prompt(self, example: dict, caption: str, use_cot: bool = False) -> str:\n",
+        "        lecture = example.get('lecture', '') or example.get('hint', '') or \"No additional context.\"\n",
+        "        question = example['question']\n",
+        "        choices = example['choices']\n",
+        "        \n",
+        "        choice_labels = ['A', 'B', 'C', 'D', 'E', 'F']\n",
+        "        formatted_choices = '\\n'.join([f\"{choice_labels[i]}. {choice}\" for i, choice in enumerate(choices)])\n",
+        "        \n",
+        "        if use_cot:\n",
+        "            prompt = f\"\"\"Context: {lecture}\n",
+        "\n",
+        "Image Description: {caption}\n",
+        "\n",
+        "Question: {question}\n",
+        "\n",
+        "Choices:\n",
+        "{formatted_choices}\n",
+        "\n",
+        "Let's think step by step:\n",
+        "1. What is the question asking?\n",
+        "2. What information is relevant?\n",
+        "3. Which choice is correct?\n",
+        "\n",
+        "Answer:\"\"\"\n",
+        "        else:\n",
+        "            prompt = f\"\"\"Context: {lecture}\n",
+        "\n",
+        "Image Description: {caption}\n",
+        "\n",
+        "Question: {question}\n",
+        "\n",
+        "Choices:\n",
+        "{formatted_choices}\n",
+        "\n",
+        "Answer:\"\"\"\n",
+        "        \n",
+        "        return prompt\n",
+        "    \n",
+        "    def get_answer_text(self, example: dict) -> str:\n",
+        "        answer_idx = example['answer']\n",
+        "        choices = example['choices']\n",
+        "        choice_labels = ['A', 'B', 'C', 'D', 'E', 'F']\n",
+        "        return f\" {choice_labels[answer_idx]}. {choices[answer_idx]}\"\n",
+        "    \n",
+        "    def caption_images_batch(self, images: List[Image.Image], batch_size: int = 32) -> List[str]:\n",
+        "        \"\"\"Caption multiple images in batches for speed\"\"\"\n",
+        "        captions = []\n",
+        "        valid_images = []\n",
+        "        valid_indices = []\n",
+        "        \n",
+        "        for idx, img in enumerate(images):\n",
+        "            if img is not None:\n",
+        "                valid_images.append(img)\n",
+        "                valid_indices.append(idx)\n",
+        "        \n",
+        "        for i in tqdm(range(0, len(valid_images), batch_size), desc=\"Captioning batches\"):\n",
+        "            batch = valid_images[i:i + batch_size]\n",
+        "            try:\n",
+        "                inputs = self.processor(images=batch, return_tensors=\"pt\", padding=True)\n",
+        "                if torch.cuda.is_available():\n",
+        "                    inputs = {k: v.to(\"cuda\") for k, v in inputs.items()}\n",
+        "                with torch.no_grad():\n",
+        "                    outputs = self.model.generate(**inputs, max_length=50)\n",
+        "                batch_captions = [self.processor.decode(out, skip_special_tokens=True) for out in outputs]\n",
+        "                captions.extend(batch_captions)\n",
+        "            except Exception as e:\n",
+        "                captions.extend([\"[Image processing failed]\"] * len(batch))\n",
+        "        \n",
+        "        result_captions = [\"[No image provided]\"] * len(images)\n",
+        "        for idx, caption in zip(valid_indices, captions):\n",
+        "            result_captions[idx] = caption\n",
+        "        \n",
+        "        return result_captions\n",
+        "    \n",
+        "    def preprocess_split(self, split: str, max_samples: Optional[int] = None) -> List[dict]:\n",
+        "        print(f\"\\nPreprocessing {split} split...\")\n",
+        "        dataset = load_dataset(self.config.dataset_name, split=split)\n",
+        "        \n",
+        "        if max_samples:\n",
+        "            dataset = dataset.select(range(min(max_samples, len(dataset))))\n",
+        "        \n",
+        "        print(f\"Processing {len(dataset)} examples...\")\n",
+        "        \n",
+        "        print(\"Extracting images...\")\n",
+        "        images = [example.get('image') for example in dataset]\n",
+        "        \n",
+        "        print(\"Captioning images in batches (this is MUCH faster)...\")\n",
+        "        captions = self.caption_images_batch(images, batch_size=32)\n",
+        "        \n",
+        "        print(\"Creating prompts...\")\n",
+        "        preprocessed = []\n",
+        "        for idx, (example, caption) in enumerate(tqdm(zip(dataset, captions), total=len(dataset), desc=\"Creating prompts\")):\n",
+        "            prompt = self.create_prompt(example, caption, use_cot=self.config.use_chain_of_thought)\n",
+        "            answer = self.get_answer_text(example)\n",
+        "            \n",
+        "            preprocessed.append({\n",
+        "                'prompt': prompt,\n",
+        "                'answer': answer,\n",
+        "                'original_idx': idx,\n",
+        "                'subject': example.get('subject', 'unknown'),\n",
+        "                'grade': example.get('grade', 'unknown'),\n",
+        "                'has_image': example.get('image') is not None,\n",
+        "                'has_text': bool(example.get('lecture', '') or example.get('hint', ''))\n",
+        "            })\n",
+        "        \n",
+        "        return preprocessed\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "d4e5f6a1b2c3"
+      },
+      "outputs": [],
+      "source": [
+        "def create_datum(example: dict, tokenizer) -> types.Datum:\n",
+        "    full_text = example['prompt'] + example['answer']\n",
+        "    full_tokens = tokenizer.encode(full_text)\n",
+        "    \n",
+        "    prompt_tokens = tokenizer.encode(example['prompt'])\n",
+        "    prompt_length = len(prompt_tokens)\n",
+        "    \n",
+        "    input_tokens = full_tokens[:-1]\n",
+        "    target_tokens = full_tokens[1:]\n",
+        "    weights = [0.0] * (prompt_length - 1) + [1.0] * (len(target_tokens) - (prompt_length - 1))\n",
+        "    \n",
+        "    return types.Datum(\n",
+        "        model_input=types.ModelInput.from_ints(tokens=input_tokens),\n",
+        "        loss_fn_inputs=dict(\n",
+        "            target_tokens=target_tokens,\n",
+        "            weights=weights\n",
+        "        )\n",
+        "    )\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "e5f6a1b2c3d4"
+      },
+      "outputs": [],
+      "source": [
+        "def evaluate_accuracy(sampling_client, tokenizer, data: List[dict], split_name: str) -> Tuple[float, int, int]:\n",
+        "    correct = 0\n",
+        "    total = 0\n",
+        "    \n",
+        "    for example in tqdm(data, desc=f\"Evaluating {split_name}\"):\n",
+        "        try:\n",
+        "            tokens = tokenizer.encode(example['prompt'], add_special_tokens=False)\n",
+        "            result = sampling_client.sample(\n",
+        "                prompt=types.ModelInput.from_ints(tokens=tokens),\n",
+        "                num_samples=1,\n",
+        "                sampling_params=types.SamplingParams(max_tokens=config.max_generation_tokens, temperature=0.0)\n",
+        "            ).result()\n",
+        "            \n",
+        "            prediction = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True).strip()\n",
+        "            ground_truth = example['answer'].strip()\n",
+        "            \n",
+        "            if ground_truth and prediction:\n",
+        "                gt_letter = ground_truth[0].upper()\n",
+        "                pred_letter = None\n",
+        "                for char in prediction:\n",
+        "                    if char.isalpha():\n",
+        "                        pred_letter = char.upper()\n",
+        "                        break\n",
+        "                if gt_letter == pred_letter:\n",
+        "                    correct += 1\n",
+        "            total += 1\n",
+        "        except:\n",
+        "            continue\n",
+        "    \n",
+        "    accuracy = (correct / total * 100) if total > 0 else 0\n",
+        "    return accuracy, correct, total\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "f6a1b2c3d4e5"
+      },
+      "outputs": [],
+      "source": [
+        "def evaluate_model_detailed(sampling_client, tokenizer, data: List[dict], model_name: str):\n",
+        "    print(f\"\\nRunning inference on {len(data)} samples...\")\n",
+        "    \n",
+        "    correct = 0\n",
+        "    total = 0\n",
+        "    results = []\n",
+        "    \n",
+        "    all_predictions = []\n",
+        "    all_labels = []\n",
+        "    all_subjects = []\n",
+        "    all_grades = []\n",
+        "    all_has_image = []\n",
+        "    all_has_text = []\n",
+        "    \n",
+        "    for example in tqdm(data):\n",
+        "        try:\n",
+        "            tokens = tokenizer.encode(example['prompt'], add_special_tokens=False)\n",
+        "            result = sampling_client.sample(\n",
+        "                prompt=types.ModelInput.from_ints(tokens=tokens),\n",
+        "                num_samples=1,\n",
+        "                sampling_params=types.SamplingParams(max_tokens=config.max_generation_tokens, temperature=0.0)\n",
+        "            ).result()\n",
+        "            \n",
+        "            prediction = tokenizer.decode(result.sequences[0].tokens, skip_special_tokens=True).strip()\n",
+        "            ground_truth = example['answer'].strip()\n",
+        "            \n",
+        "            is_correct = False\n",
+        "            if ground_truth and prediction:\n",
+        "                gt_letter = ground_truth[0].upper()\n",
+        "                gt_idx = ord(gt_letter) - ord('A')\n",
+        "                \n",
+        "                pred_letter = None\n",
+        "                for char in prediction:\n",
+        "                    if char.isalpha():\n",
+        "                        pred_letter = char.upper()\n",
+        "                        break\n",
+        "                pred_idx = ord(pred_letter) - ord('A') if pred_letter else -1\n",
+        "                \n",
+        "                is_correct = (gt_letter == pred_letter) if pred_letter else False\n",
+        "                \n",
+        "                all_predictions.append(pred_idx)\n",
+        "                all_labels.append(gt_idx)\n",
+        "                all_subjects.append(example.get('subject', 'unknown'))\n",
+        "                all_grades.append(example.get('grade', 'unknown'))\n",
+        "                all_has_image.append(example.get('has_image', False))\n",
+        "                all_has_text.append(example.get('has_text', False))\n",
+        "            \n",
+        "            if is_correct:\n",
+        "                correct += 1\n",
+        "            total += 1\n",
+        "            \n",
+        "            results.append({\n",
+        "                'correct': is_correct,\n",
+        "                'prediction': prediction,\n",
+        "                'ground_truth': ground_truth\n",
+        "            })\n",
+        "        except:\n",
+        "            continue\n",
+        "    \n",
+        "    accuracy = (correct / total * 100) if total > 0 else 0\n",
+        "    \n",
+        "    predictions = np.array(all_predictions)\n",
+        "    labels = np.array(all_labels)\n",
+        "    subjects = np.array(all_subjects)\n",
+        "    grades = np.array(all_grades)\n",
+        "    has_image_arr = np.array(all_has_image)\n",
+        "    has_text_arr = np.array(all_has_text)\n",
+        "    \n",
+        "    detailed_results = {}\n",
+        "    detailed_results['Overall'] = (predictions == labels).mean() * 100 if len(predictions) > 0 else 0\n",
+        "    \n",
+        "    for subject in ['natural science', 'social science', 'language science']:\n",
+        "        mask = subjects == subject\n",
+        "        if mask.sum() > 0:\n",
+        "            acc = (predictions[mask] == labels[mask]).mean() * 100\n",
+        "            detailed_results[subject] = acc\n",
+        "        else:\n",
+        "            detailed_results[subject] = 0.0\n",
+        "    \n",
+        "    context_types = [\n",
+        "        ('TXT', has_text_arr & ~has_image_arr),\n",
+        "        ('IMG', has_image_arr & ~has_text_arr),\n",
+        "        ('NO', ~has_image_arr & ~has_text_arr),\n",
+        "        ('TXT+IMG', has_image_arr & has_text_arr)\n",
+        "    ]\n",
+        "    \n",
+        "    for key, mask in context_types:\n",
+        "        if mask.sum() > 0:\n",
+        "            acc = (predictions[mask] == labels[mask]).mean() * 100\n",
+        "            detailed_results[key] = acc\n",
+        "        else:\n",
+        "            detailed_results[key] = 0.0\n",
+        "    \n",
+        "    grade_nums = []\n",
+        "    for g in grades:\n",
+        "        try:\n",
+        "            grade_nums.append(int(g.replace('grade', '')))\n",
+        "        except:\n",
+        "            grade_nums.append(0)\n",
+        "    grade_nums = np.array(grade_nums)\n",
+        "    \n",
+        "    for key, condition in [('G1-6', (grade_nums >= 1) & (grade_nums <= 6)),\n",
+        "                           ('G7-12', (grade_nums >= 7) & (grade_nums <= 12))]:\n",
+        "        if condition.sum() > 0:\n",
+        "            detailed_results[key] = (predictions[condition] == labels[condition]).mean() * 100\n",
+        "        else:\n",
+        "            detailed_results[key] = 0.0\n",
+        "    \n",
+        "    print(f\"\\nOverall: {detailed_results['Overall']:.2f}%\")\n",
+        "    print(f\"Subject: NAT={detailed_results.get('natural science', 0):.2f}% | SOC={detailed_results.get('social science', 0):.2f}% | LAN={detailed_results.get('language science', 0):.2f}%\")\n",
+        "    print(f\"Context: TXT={detailed_results.get('TXT', 0):.2f}% | IMG={detailed_results.get('IMG', 0):.2f}% | NO={detailed_results.get('NO', 0):.2f}% | TXT+IMG={detailed_results.get('TXT+IMG', 0):.2f}%\")\n",
+        "    print(f\"Grade:   G1-6={detailed_results.get('G1-6', 0):.2f}% | G7-12={detailed_results.get('G7-12', 0):.2f}%\")\n",
+        "    \n",
+        "    return {\n",
+        "        'model': model_name,\n",
+        "        'accuracy': accuracy,\n",
+        "        'correct': correct,\n",
+        "        'total': total,\n",
+        "        'results': results,\n",
+        "        'detailed_metrics': detailed_results\n",
+        "    }\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "a2b3c4d5e6f7"
+      },
+      "outputs": [],
+      "source": [
+        "def train_model(train_data: List[dict], val_data: List[dict], service_client):\n",
+        "    print(\"\\nTraining with regularization...\")\n",
+        "    \n",
+        "    print(f\"Creating LoRA training client...\")\n",
+        "    training_client = service_client.create_lora_training_client(\n",
+        "        base_model=config.model_name,\n",
+        "        rank=config.lora_r\n",
+        "    )\n",
+        "    \n",
+        "    tokenizer = training_client.get_tokenizer()\n",
+        "    \n",
+        "    print(\"Converting to Tinker Datum format...\")\n",
+        "    train_datums = [create_datum(ex, tokenizer) for ex in tqdm(train_data, desc=\"Converting\")]\n",
+        "    \n",
+        "    steps_per_epoch = max(1, len(train_datums) // config.batch_size)\n",
+        "    total_steps = steps_per_epoch * config.num_epochs\n",
+        "    \n",
+        "    print(f\"\\nTraining configuration:\")\n",
+        "    print(f\"  Training examples: {len(train_datums):,}\")\n",
+        "    print(f\"  Validation examples: {len(val_data):,}\")\n",
+        "    print(f\"  Batch size: {config.batch_size}\")\n",
+        "    print(f\"  Steps per epoch: {steps_per_epoch:,}\")\n",
+        "    print(f\"  Epochs: {config.num_epochs}\")\n",
+        "    print(f\"  Total steps: {total_steps:,}\")\n",
+        "    print(f\"  Learning rate: {config.learning_rate}\")\n",
+        "    print(f\"  LoRA rank: {config.lora_r}\")\n",
+        "    print(f\"  Eval every N steps: {config.eval_every_n_steps}\")\n",
+        "    \n",
+        "    print(\"\\nTraining...\")\n",
+        "    \n",
+        "    adam_params = types.AdamParams(learning_rate=config.learning_rate)\n",
+        "    \n",
+        "    losses = []\n",
+        "    eval_steps = []\n",
+        "    train_accuracies = []\n",
+        "    val_accuracies = []\n",
+        "    \n",
+        "    with tqdm(total=total_steps, desc=\"Training\") as pbar:\n",
+        "        for step in range(total_steps):\n",
+        "            batch = []\n",
+        "            for i in range(config.batch_size):\n",
+        "                idx = (step * config.batch_size + i) % len(train_datums)\n",
+        "                batch.append(train_datums[idx])\n",
+        "            \n",
+        "            try:\n",
+        "                result = training_client.forward_backward(\n",
+        "                    data=batch,\n",
+        "                    loss_fn=\"cross_entropy\"\n",
+        "                ).result()\n",
+        "                \n",
+        "                loss = result.metrics.get('loss', 0.0)\n",
+        "                losses.append(loss)\n",
+        "                \n",
+        "                training_client.optim_step(adam_params=adam_params).result()\n",
+        "                \n",
+        "                pbar.update(1)\n",
+        "                pbar.set_postfix({'loss': f'{loss:.4f}'})\n",
+        "                \n",
+        "                if (step + 1) % config.eval_every_n_steps == 0:\n",
+        "                    print(f\"\\n\\nCheckpoint at step {step+1}\")\n",
+        "                    \n",
+        "                    temp_client = training_client.save_weights_and_get_sampling_client(\n",
+        "                        name=f\"checkpoint_step_{step+1}\"\n",
+        "                    )\n",
+        "                    current_client = temp_client.result() if hasattr(temp_client, 'result') else temp_client\n",
+        "                    \n",
+        "                    train_subset = train_data[:50]\n",
+        "                    val_subset = val_data[:50]\n",
+        "                    \n",
+        "                    train_acc, _, _ = evaluate_accuracy(current_client, tokenizer, train_subset, \"Train\")\n",
+        "                    val_acc, _, _ = evaluate_accuracy(current_client, tokenizer, val_subset, \"Val\")\n",
+        "                    \n",
+        "                    eval_steps.append(step + 1)\n",
+        "                    train_accuracies.append(train_acc)\n",
+        "                    val_accuracies.append(val_acc)\n",
+        "                    \n",
+        "                    print(f\"Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%\")\n",
+        "                    \n",
+        "                    if train_acc - val_acc > 15:\n",
+        "                        print(f\"Warning: Potential overfitting detected (Train-Val gap: {train_acc - val_acc:.2f}%)\")\n",
+        "                \n",
+        "            except Exception as e:\n",
+        "                print(f\"\\nError at step {step}: {e}\")\n",
+        "                pbar.update(1)\n",
+        "    \n",
+        "    print(f\"\\nTraining complete\")\n",
+        "    \n",
+        "    result = training_client.save_weights_and_get_sampling_client(\n",
+        "        name=\"scienceqa_final_model\"\n",
+        "    )\n",
+        "    sampling_client = result.result() if hasattr(result, 'result') else result\n",
+        "    \n",
+        "    return sampling_client, tokenizer, {\n",
+        "        'losses': losses,\n",
+        "        'eval_steps': eval_steps,\n",
+        "        'train_accuracies': train_accuracies,\n",
+        "        'val_accuracies': val_accuracies\n",
+        "    }\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "b3c4d5e6f7a2"
+      },
+      "outputs": [],
+      "source": [
+        "def plot_metrics(metrics: dict, output_dir: str):\n",
+        "    os.makedirs(output_dir, exist_ok=True)\n",
+        "    \n",
+        "    plt.figure(figsize=(10, 6))\n",
+        "    plt.plot(metrics['losses'], alpha=0.6, label='Training Loss')\n",
+        "    \n",
+        "    window = 20\n",
+        "    if len(metrics['losses']) > window:\n",
+        "        moving_avg = [sum(metrics['losses'][max(0, i-window):i+1]) / min(window, i+1)\n",
+        "                      for i in range(len(metrics['losses']))]\n",
+        "        plt.plot(moving_avg, linewidth=2, label=f'Moving Avg (window={window})')\n",
+        "    \n",
+        "    plt.xlabel('Training Step')\n",
+        "    plt.ylabel('Loss')\n",
+        "    plt.title('Training Loss Over Time')\n",
+        "    plt.legend()\n",
+        "    plt.grid(True, alpha=0.3)\n",
+        "    plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=300, bbox_inches='tight')\n",
+        "    plt.close()\n",
+        "    \n",
+        "    if metrics['eval_steps']:\n",
+        "        plt.figure(figsize=(10, 6))\n",
+        "        plt.plot(metrics['eval_steps'], metrics['train_accuracies'],\n",
+        "                marker='o', label='Training Accuracy', linewidth=2)\n",
+        "        plt.plot(metrics['eval_steps'], metrics['val_accuracies'],\n",
+        "                marker='s', label='Validation Accuracy', linewidth=2)\n",
+        "        \n",
+        "        plt.xlabel('Training Step')\n",
+        "        plt.ylabel('Accuracy (%)')\n",
+        "        plt.title('Training vs Validation Accuracy')\n",
+        "        plt.legend()\n",
+        "        plt.grid(True, alpha=0.3)\n",
+        "        \n",
+        "        for i in range(len(metrics['eval_steps'])):\n",
+        "            if metrics['train_accuracies'][i] - metrics['val_accuracies'][i] > 15:\n",
+        "                plt.axvspan(metrics['eval_steps'][max(0, i-1)],\n",
+        "                           metrics['eval_steps'][i],\n",
+        "                           alpha=0.2, color='red', label='Overfitting' if i == 0 else '')\n",
+        "        \n",
+        "        plt.savefig(os.path.join(output_dir, 'accuracy_comparison.png'), dpi=300, bbox_inches='tight')\n",
+        "        plt.close()\n",
+        "    \n",
+        "    print(f\"\\nPlots saved to {output_dir}/\")\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "c4d5e6f7a2b3"
+      },
+      "outputs": [],
+      "source": [
+        "def main():\n",
+        "    print(\"\\nScienceQA: Complete ML Pipeline\")\n",
+        "    print(\"Features:\")\n",
+        "    print(\"  Regularization (dropout, weight decay)\")\n",
+        "    print(\"  Train, Validation, and Test splits\")\n",
+        "    print(\"  Overfitting detection\")\n",
+        "    print(\"  Periodic evaluation during training\")\n",
+        "    print(\"  Detailed metrics breakdown\")\n",
+        "    \n",
+        "    print(f\"\\nConfiguration:\")\n",
+        "    print(f\"  Train: {config.num_train_samples:,} samples\")\n",
+        "    print(f\"  Validation: {config.num_val_samples} samples\")\n",
+        "    print(f\"  Test: {config.num_test_samples} samples\")\n",
+        "    print(f\"  Batch size: {config.batch_size}\")\n",
+        "    print(f\"  Epochs: {config.num_epochs}\")\n",
+        "    print(f\"  LoRA rank: {config.lora_r}\")\n",
+        "    \n",
+        "    service_client = tinker.ServiceClient()\n",
+        "    \n",
+        "    print(\"\\nPhase 1: Preprocessing\")\n",
+        "    \n",
+        "    size_str = f\"{config.num_train_samples}_{config.num_val_samples}_{config.num_test_samples}\"\n",
+        "    train_file = f\"train_cot{config.use_chain_of_thought}_{size_str}.json\"\n",
+        "    val_file = f\"val_cot{config.use_chain_of_thought}_{size_str}.json\"\n",
+        "    test_file = f\"test_cot{config.use_chain_of_thought}_{size_str}.json\"\n",
+        "    \n",
+        "    train_path = os.path.join(config.preprocessed_data_dir, train_file)\n",
+        "    val_path = os.path.join(config.preprocessed_data_dir, val_file)\n",
+        "    test_path = os.path.join(config.preprocessed_data_dir, test_file)\n",
+        "    \n",
+        "    if os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(test_path):\n",
+        "        print(\"\\nLoading existing preprocessed data...\")\n",
+        "        with open(train_path, 'r') as f:\n",
+        "            train_data = json.load(f)\n",
+        "        with open(val_path, 'r') as f:\n",
+        "            val_data = json.load(f)\n",
+        "        with open(test_path, 'r') as f:\n",
+        "            test_data = json.load(f)\n",
+        "        print(f\"Loaded {len(train_data):,} train, {len(val_data)} val, {len(test_data)} test\")\n",
+        "    else:\n",
+        "        print(\"\\nPreprocessing data...\")\n",
+        "        preprocessor = BLIPPreprocessor(config)\n",
+        "        \n",
+        "        train_data = preprocessor.preprocess_split(\"train\", config.num_train_samples)\n",
+        "        val_data = preprocessor.preprocess_split(\"validation\", config.num_val_samples)\n",
+        "        test_data = preprocessor.preprocess_split(\"test\", config.num_test_samples)\n",
+        "        \n",
+        "        os.makedirs(config.preprocessed_data_dir, exist_ok=True)\n",
+        "        with open(train_path, 'w') as f:\n",
+        "            json.dump(train_data, f)\n",
+        "        with open(val_path, 'w') as f:\n",
+        "            json.dump(val_data, f)\n",
+        "        with open(test_path, 'w') as f:\n",
+        "            json.dump(test_data, f)\n",
+        "        print(\"Saved preprocessed data\")\n",
+        "    \n",
+        "    finetuned_client, tokenizer, metrics = train_model(train_data, val_data, service_client)\n",
+        "    \n",
+        "    print(\"\\nFinal Evaluation\")\n",
+        "    \n",
+        "    base_client = service_client.create_sampling_client(base_model=config.model_name)\n",
+        "    \n",
+        "    print(\"\\n[BASE MODEL]\")\n",
+        "    base_train_acc, base_train_correct, base_train_total = evaluate_accuracy(\n",
+        "        base_client, tokenizer, train_data[:200], \"Base-Train\")\n",
+        "    base_val = evaluate_model_detailed(base_client, tokenizer, val_data, \"Base-Val\")\n",
+        "    base_test_acc, base_test_correct, base_test_total = evaluate_accuracy(\n",
+        "        base_client, tokenizer, test_data, \"Base-Test\")\n",
+        "    \n",
+        "    print(\"\\n[FINE-TUNED MODEL]\")\n",
+        "    ft_train_acc, ft_train_correct, ft_train_total = evaluate_accuracy(\n",
+        "        finetuned_client, tokenizer, train_data[:200], \"FT-Train\")\n",
+        "    ft_val = evaluate_model_detailed(finetuned_client, tokenizer, val_data, \"FT-Val\")\n",
+        "    ft_test_acc, ft_test_correct, ft_test_total = evaluate_accuracy(\n",
+        "        finetuned_client, tokenizer, test_data, \"FT-Test\")\n",
+        "    \n",
+        "    print(\"\\n\")\n",
+        "    print(f\"+{'-'*14}+{'-'*10}+{'-'*14}+{'-'*17}+\")\n",
+        "    print(f\"| {'Model':<12} | {'Split':<8} | {'Accuracy':<12} | {'Correct':<15} |\")\n",
+        "    print(f\"+{'-'*14}+{'-'*10}+{'-'*14}+{'-'*17}+\")\n",
+        "    print(f\"| {'BASE':<12} | {'Train':<8} | {base_train_acc:6.2f}%     | {base_train_correct:3d}/{base_train_total:3d}         |\")\n",
+        "    print(f\"| {'BASE':<12} | {'Val':<8} | {base_val['accuracy']:6.2f}%     | {base_val['correct']:3d}/{base_val['total']:3d}         |\")\n",
+        "    print(f\"| {'BASE':<12} | {'Test':<8} | {base_test_acc:6.2f}%     | {base_test_correct:3d}/{base_test_total:3d}         |\")\n",
+        "    print(f\"+{'-'*14}+{'-'*10}+{'-'*14}+{'-'*17}+\")\n",
+        "    print(f\"| {'FINE-TUNED':<12} | {'Train':<8} | {ft_train_acc:6.2f}%     | {ft_train_correct:3d}/{ft_train_total:3d}         |\")\n",
+        "    print(f\"| {'FINE-TUNED':<12} | {'Val':<8} | {ft_val['accuracy']:6.2f}%     | {ft_val['correct']:3d}/{ft_val['total']:3d}         |\")\n",
+        "    print(f\"| {'FINE-TUNED':<12} | {'Test':<8} | {ft_test_acc:6.2f}%     | {ft_test_correct:3d}/{ft_test_total:3d}         |\")\n",
+        "    print(f\"+{'-'*14}+{'-'*10}+{'-'*14}+{'-'*17}+\")\n",
+        "    \n",
+        "    train_val_gap = ft_train_acc - ft_val['accuracy']\n",
+        "    val_test_gap = abs(ft_val['accuracy'] - ft_test_acc)\n",
+        "    \n",
+        "    print(f\"\\nOverfitting Analysis:\")\n",
+        "    print(f\"Train-Val gap: {train_val_gap:+.2f}%\")\n",
+        "    print(f\"Val-Test gap: {val_test_gap:+.2f}%\")\n",
+        "    \n",
+        "    if train_val_gap > 15:\n",
+        "        print(\"Overfitting detected! Train >> Val\")\n",
+        "    elif train_val_gap > 8:\n",
+        "        print(\"Mild overfitting. Train > Val\")\n",
+        "    else:\n",
+        "        print(\"No significant overfitting\")\n",
+        "    \n",
+        "    if val_test_gap < 5:\n",
+        "        print(\"Good generalization! Val ~ Test\")\n",
+        "    else:\n",
+        "        print(f\"Val-Test mismatch ({val_test_gap:.1f}%) - model may not generalize well\")\n",
+        "    \n",
+        "    val_improvement = ft_val['accuracy'] - base_val['accuracy']\n",
+        "    test_improvement = ft_test_acc - base_test_acc\n",
+        "    \n",
+        "    print(f\"\\nImprovement:\")\n",
+        "    print(f\"Validation: {val_improvement:+.2f}%\")\n",
+        "    print(f\"Test: {test_improvement:+.2f}%\")\n",
+        "    \n",
+        "    os.makedirs(config.output_dir, exist_ok=True)\n",
+        "    \n",
+        "    output = {\n",
+        "        'base_model': {\n",
+        "            'train_accuracy': base_train_acc,\n",
+        "            'val_accuracy': base_val['accuracy'],\n",
+        "            'test_accuracy': base_test_acc,\n",
+        "            'val_results': base_val,\n",
+        "            'val_detailed': base_val.get('detailed_metrics', {})\n",
+        "        },\n",
+        "        'finetuned_model': {\n",
+        "            'train_accuracy': ft_train_acc,\n",
+        "            'val_accuracy': ft_val['accuracy'],\n",
+        "            'test_accuracy': ft_test_acc,\n",
+        "            'val_results': ft_val,\n",
+        "            'val_detailed': ft_val.get('detailed_metrics', {})\n",
+        "        },\n",
+        "        'improvement': {\n",
+        "            'val': val_improvement,\n",
+        "            'test': test_improvement\n",
+        "        },\n",
+        "        'overfitting_metrics': {\n",
+        "            'train_val_gap': train_val_gap,\n",
+        "            'val_test_gap': val_test_gap\n",
+        "        },\n",
+        "        'training_metrics': metrics,\n",
+        "        'config': config.__dict__\n",
+        "    }\n",
+        "    \n",
+        "    output_file = os.path.join(config.output_dir, \"complete_results.json\")\n",
+        "    with open(output_file, 'w') as f:\n",
+        "        json.dump(output, f, indent=2)\n",
+        "    \n",
+        "    print(f\"\\nResults saved to: {output_file}\")\n",
+        "    \n",
+        "    plot_metrics(metrics, config.plots_dir)\n",
+        "    \n",
+        "    print(\"\\nComplete!\")\n"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "d5e6f7a2b3c4"
+      },
+      "outputs": [],
+      "source": [
+        "if __name__ == \"__main__\":\n",
+        "    main()\n"
+      ]
     }
-
-
-def train_model(train_data: List[dict], val_data: List[dict], service_client):
-    print("\nTraining with regularization...")
-    
-    print(f"Creating LoRA training client...")
-    training_client = service_client.create_lora_training_client(
-        base_model=config.model_name,
-        rank=config.lora_r
-    )
-    
-    tokenizer = training_client.get_tokenizer()
-    
-    print("Converting to Tinker Datum format...")
-    train_datums = [create_datum(ex, tokenizer) for ex in tqdm(train_data, desc="Converting")]
-    
-    steps_per_epoch = max(1, len(train_datums) // config.batch_size)
-    total_steps = steps_per_epoch * config.num_epochs
-    
-    print(f"\nTraining configuration:")
-    print(f"  Training examples: {len(train_datums):,}")
-    print(f"  Validation examples: {len(val_data):,}")
-    print(f"  Batch size: {config.batch_size}")
-    print(f"  Steps per epoch: {steps_per_epoch:,}")
-    print(f"  Epochs: {config.num_epochs}")
-    print(f"  Total steps: {total_steps:,}")
-    print(f"  Learning rate: {config.learning_rate}")
-    print(f"  LoRA rank: {config.lora_r}")
-    print(f"  Eval every N steps: {config.eval_every_n_steps}")
-    
-    print("\nTraining...")
-    
-    adam_params = types.AdamParams(learning_rate=config.learning_rate)
-    
-    losses = []
-    eval_steps = []
-    train_accuracies = []
-    val_accuracies = []
-    
-    with tqdm(total=total_steps, desc="Training") as pbar:
-        for step in range(total_steps):
-            batch = []
-            for i in range(config.batch_size):
-                idx = (step * config.batch_size + i) % len(train_datums)
-                batch.append(train_datums[idx])
-            
-            try:
-                result = training_client.forward_backward(
-                    data=batch,
-                    loss_fn="cross_entropy"
-                ).result()
-                
-                loss = result.metrics.get('loss', 0.0)
-                losses.append(loss)
-                
-                training_client.optim_step(adam_params=adam_params).result()
-                
-                pbar.update(1)
-                pbar.set_postfix({'loss': f'{loss:.4f}'})
-                
-                if (step + 1) % config.eval_every_n_steps == 0:
-                    print(f"\n\nCheckpoint at step {step+1}")
-                    
-                    temp_client = training_client.save_weights_and_get_sampling_client(
-                        name=f"checkpoint_step_{step+1}"
-                    )
-                    current_client = temp_client.result() if hasattr(temp_client, 'result') else temp_client
-                    
-                    train_subset = train_data[:50]
-                    val_subset = val_data[:50]
-                    
-                    train_acc, _, _ = evaluate_accuracy(current_client, tokenizer, train_subset, "Train")
-                    val_acc, _, _ = evaluate_accuracy(current_client, tokenizer, val_subset, "Val")
-                    
-                    eval_steps.append(step + 1)
-                    train_accuracies.append(train_acc)
-                    val_accuracies.append(val_acc)
-                    
-                    print(f"Train Acc: {train_acc:.2f}% | Val Acc: {val_acc:.2f}%")
-                    
-                    if train_acc - val_acc > 15:
-                        print(f"⚠️  Warning: Potential overfitting detected (Train-Val gap: {train_acc - val_acc:.2f}%)")
-                
-            except Exception as e:
-                print(f"\nError at step {step}: {e}")
-                pbar.update(1)
-    
-    print(f"\nTraining complete")
-    
-    result = training_client.save_weights_and_get_sampling_client(
-        name="scienceqa_final_model"
-    )
-    sampling_client = result.result() if hasattr(result, 'result') else result
-    
-    return sampling_client, tokenizer, {
-        'losses': losses,
-        'eval_steps': eval_steps,
-        'train_accuracies': train_accuracies,
-        'val_accuracies': val_accuracies
-    }
-
-
-def plot_metrics(metrics: dict, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(metrics['losses'], alpha=0.6, label='Training Loss')
-    
-    window = 20
-    if len(metrics['losses']) > window:
-        moving_avg = [sum(metrics['losses'][max(0, i-window):i+1]) / min(window, i+1) 
-                      for i in range(len(metrics['losses']))]
-        plt.plot(moving_avg, linewidth=2, label=f'Moving Avg (window={window})')
-    
-    plt.xlabel('Training Step')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Over Time')
-    plt.legend()
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join(output_dir, 'training_loss.png'), dpi=300, bbox_inches='tight')
-    plt.close()
-    
-    if metrics['eval_steps']:
-        plt.figure(figsize=(10, 6))
-        plt.plot(metrics['eval_steps'], metrics['train_accuracies'], 
-                marker='o', label='Training Accuracy', linewidth=2)
-        plt.plot(metrics['eval_steps'], metrics['val_accuracies'], 
-                marker='s', label='Validation Accuracy', linewidth=2)
-        
-        plt.xlabel('Training Step')
-        plt.ylabel('Accuracy (%)')
-        plt.title('Training vs Validation Accuracy')
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        
-        for i in range(len(metrics['eval_steps'])):
-            if metrics['train_accuracies'][i] - metrics['val_accuracies'][i] > 15:
-                plt.axvspan(metrics['eval_steps'][max(0, i-1)], 
-                           metrics['eval_steps'][i], 
-                           alpha=0.2, color='red', label='Overfitting' if i == 0 else '')
-        
-        plt.savefig(os.path.join(output_dir, 'accuracy_comparison.png'), dpi=300, bbox_inches='tight')
-        plt.close()
-    
-    print(f"\nPlots saved to {output_dir}/")
-
-
-def main():
-    print("\nScienceQA: Complete ML Pipeline")
-    print("Features:")
-    print("  ✓ Regularization (dropout, weight decay)")
-    print("  ✓ Train, Validation, and Test splits")
-    print("  ✓ Overfitting detection")
-    print("  ✓ Periodic evaluation during training")
-    print("  ✓ Detailed metrics breakdown")
-    
-    print(f"\nConfiguration:")
-    print(f"  Train: {config.num_train_samples:,} samples")
-    print(f"  Validation: {config.num_val_samples} samples")
-    print(f"  Test: {config.num_test_samples} samples")
-    print(f"  Batch size: {config.batch_size}")
-    print(f"  Epochs: {config.num_epochs}")
-    print(f"  LoRA rank: {config.lora_r}")
-    
-    service_client = tinker.ServiceClient()
-    
-    print("\nPhase 1: Preprocessing")
-    
-    size_str = f"{config.num_train_samples}_{config.num_val_samples}_{config.num_test_samples}"
-    train_file = f"train_cot{config.use_chain_of_thought}_{size_str}.json"
-    val_file = f"val_cot{config.use_chain_of_thought}_{size_str}.json"
-    test_file = f"test_cot{config.use_chain_of_thought}_{size_str}.json"
-    
-    train_path = os.path.join(config.preprocessed_data_dir, train_file)
-    val_path = os.path.join(config.preprocessed_data_dir, val_file)
-    test_path = os.path.join(config.preprocessed_data_dir, test_file)
-    
-    if os.path.exists(train_path) and os.path.exists(val_path) and os.path.exists(test_path):
-        print("\nLoading existing preprocessed data...")
-        with open(train_path, 'r') as f:
-            train_data = json.load(f)
-        with open(val_path, 'r') as f:
-            val_data = json.load(f)
-        with open(test_path, 'r') as f:
-            test_data = json.load(f)
-        print(f"Loaded {len(train_data):,} train, {len(val_data)} val, {len(test_data)} test")
-    else:
-        print("\nPreprocessing data...")
-        preprocessor = BLIPPreprocessor(config)
-        
-        train_data = preprocessor.preprocess_split("train", config.num_train_samples)
-        val_data = preprocessor.preprocess_split("validation", config.num_val_samples)
-        test_data = preprocessor.preprocess_split("test", config.num_test_samples)
-        
-        os.makedirs(config.preprocessed_data_dir, exist_ok=True)
-        with open(train_path, 'w') as f:
-            json.dump(train_data, f)
-        with open(val_path, 'w') as f:
-            json.dump(val_data, f)
-        with open(test_path, 'w') as f:
-            json.dump(test_data, f)
-        print("Saved preprocessed data")
-    
-    finetuned_client, tokenizer, metrics = train_model(train_data, val_data, service_client)
-    
-    print("\nFinal Evaluation")
-    
-    base_client = service_client.create_sampling_client(base_model=config.model_name)
-    
-    print("\n[BASE MODEL]")
-    base_train_acc, base_train_correct, base_train_total = evaluate_accuracy(
-        base_client, tokenizer, train_data[:200], "Base-Train")
-    base_val = evaluate_model_detailed(base_client, tokenizer, val_data, "Base-Val")
-    base_test_acc, base_test_correct, base_test_total = evaluate_accuracy(
-        base_client, tokenizer, test_data, "Base-Test")
-    
-    print("\n[FINE-TUNED MODEL]")
-    ft_train_acc, ft_train_correct, ft_train_total = evaluate_accuracy(
-        finetuned_client, tokenizer, train_data[:200], "FT-Train")
-    ft_val = evaluate_model_detailed(finetuned_client, tokenizer, val_data, "FT-Val")
-    ft_test_acc, ft_test_correct, ft_test_total = evaluate_accuracy(
-        finetuned_client, tokenizer, test_data, "FT-Test")
-    
-    print("\n")
-    print(f"┌──────────────┬──────────┬──────────────┬─────────────────┐")
-    print(f"│ Model        │ Split    │ Accuracy     │ Correct         │")
-    print(f"├──────────────┼──────────┼──────────────┼─────────────────┤")
-    print(f"│ BASE         │ Train    │ {base_train_acc:6.2f}%     │ {base_train_correct:3d}/{base_train_total:3d}         │")
-    print(f"│ BASE         │ Val      │ {base_val['accuracy']:6.2f}%     │ {base_val['correct']:3d}/{base_val['total']:3d}         │")
-    print(f"│ BASE         │ Test     │ {base_test_acc:6.2f}%     │ {base_test_correct:3d}/{base_test_total:3d}         │")
-    print(f"├──────────────┼──────────┼──────────────┼─────────────────┤")
-    print(f"│ FINE-TUNED   │ Train    │ {ft_train_acc:6.2f}%     │ {ft_train_correct:3d}/{ft_train_total:3d}         │")
-    print(f"│ FINE-TUNED   │ Val      │ {ft_val['accuracy']:6.2f}%     │ {ft_val['correct']:3d}/{ft_val['total']:3d}         │")
-    print(f"│ FINE-TUNED   │ Test     │ {ft_test_acc:6.2f}%     │ {ft_test_correct:3d}/{ft_test_total:3d}         │")
-    print(f"└──────────────┴──────────┴──────────────┴─────────────────┘")
-    
-    train_val_gap = ft_train_acc - ft_val['accuracy']
-    val_test_gap = abs(ft_val['accuracy'] - ft_test_acc)
-    
-    print(f"\nOverfitting Analysis:")
-    print(f"Train-Val gap: {train_val_gap:+.2f}%")
-    print(f"Val-Test gap: {val_test_gap:+.2f}%")
-    
-    if train_val_gap > 15:
-        print("⚠️  Overfitting detected! Train >> Val")
-    elif train_val_gap > 8:
-        print("⚠️  Mild overfitting. Train > Val")
-    else:
-        print("✓ No significant overfitting")
-    
-    if val_test_gap < 5:
-        print("✓ Good generalization! Val ≈ Test")
-    else:
-        print(f"⚠️  Val-Test mismatch ({val_test_gap:.1f}%) - model may not generalize well")
-    
-    val_improvement = ft_val['accuracy'] - base_val['accuracy']
-    test_improvement = ft_test_acc - base_test_acc
-    
-    print(f"\nImprovement:")
-    print(f"Validation: {val_improvement:+.2f}%")
-    print(f"Test: {test_improvement:+.2f}%")
-    
-    os.makedirs(config.output_dir, exist_ok=True)
-    
-    output = {
-        'base_model': {
-            'train_accuracy': base_train_acc,
-            'val_accuracy': base_val['accuracy'],
-            'test_accuracy': base_test_acc,
-            'val_results': base_val,
-            'val_detailed': base_val.get('detailed_metrics', {})
-        },
-        'finetuned_model': {
-            'train_accuracy': ft_train_acc,
-            'val_accuracy': ft_val['accuracy'],
-            'test_accuracy': ft_test_acc,
-            'val_results': ft_val,
-            'val_detailed': ft_val.get('detailed_metrics', {})
-        },
-        'improvement': {
-            'val': val_improvement,
-            'test': test_improvement
-        },
-        'overfitting_metrics': {
-            'train_val_gap': train_val_gap,
-            'val_test_gap': val_test_gap
-        },
-        'training_metrics': metrics,
-        'config': config.__dict__
-    }
-    
-    output_file = os.path.join(config.output_dir, "complete_results.json")
-    with open(output_file, 'w') as f:
-        json.dump(output, f, indent=2)
-    
-    print(f"\nResults saved to: {output_file}")
-    
-    plot_metrics(metrics, config.plots_dir)
-    
-    print("\n✓ Complete!")
-
-
-if __name__ == "__main__":
-    main()
+  ]
+}
